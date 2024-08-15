@@ -250,8 +250,7 @@ public:
 	// Getters 
 	std::vector<size_t> get_shape() { return { x_dim, y_dim }; };
 	std::string get_location() { return loc; };
-	float* get_data() { return data; };
-
+	
 private:
 	// Pointers to data (allocated on host or device heap). Note that smart pointers 
 	// are not an option with CUDA (so we have to make due with regular pointers).
@@ -286,6 +285,21 @@ Tensor::Tensor(size_t x_dim, size_t y_dim, std::string loc) {
 	else if (loc == "pinned") {
 		this->data_h = allocate_array(x_dim, y_dim, "pinned");
 		this->data_d = allocate_array(x_dim, y_dim, "gpu");
+	};
+};
+
+float* Tensor::get_data(std::string loc) {
+	/* Return pointer to data on host */
+
+	if (loc == "cpu") {
+		assert (data_h != nullptr);
+
+		return data_h;
+	}
+	else if (loc == "gpu") {
+		assert (data_d != nullptr);
+
+		return data_d;
 	};
 };
 
@@ -348,10 +362,10 @@ void Tensor::to(std::string dest) {
 
 	assert (this->loc == "pinned");
 
-	if (dest == "host") {
+	if (dest == "cpu") {
 		cudaMemcpy(data_h, data_d, x_dim * y_dim * sizeof(float), cudaMemcpyDeviceToHost);
 	}
-	else if (dest == "device") {
+	else if (dest == "gpu") {
 		cudaMemcpy(data_d, data_h, x_dim * y_dim * sizeof(float), cudaMemcpyHostToDevice);
 	};
 };
@@ -559,13 +573,13 @@ auto Data_loader::get_batch(int batch_idx) {
 
 		// One-hot encode label and save as y tensor data 
 		for (int i = 0; i < this->num_classes; i++) {
-			y.get_data()[i][obs_idx] = (i == label) ? 1.0f : 0.0f;
+			y.get_data('cpu')[i][obs_idx] = (i == label) ? 1.0f : 0.0f;
 		};
 		
 		// Flatten image and and save as X tensor data 
 		for (int i = 0; i < img.rows; i++) {
 			for (int j = 0; j < img.cols; j++) {
-				X.get_data()[i * img.cols + j][obs_idx] = img.at<float>(i, j);
+				X.get_data("cpu")[i * img.cols + j][obs_idx] = img.at<float>(i, j);
 			};
 		};
 	};
@@ -622,6 +636,12 @@ ReLU::ReLU(size_t in_features, std::string loc, size_t batch_size) : in_features
 	// Initialize input and output to zeros (for debugging purposes)
 	this->in.set_data(0);
 	this->out.set_data(0);
+
+	// Compute optimal kernel configuration for forward pass. The 
+	// input has shape (in_features, batch_size) and the output has
+	// the same shape. 
+	this->block_size_fw = dim3(32, 32);
+	this->grid_size_fw = dim3((in_features + block_size_fw.x - 1) / block_size_fw.x, (batch_size + block_size_fw.y - 1) / block_size_fw.y);
 };
 
 void ReLU::reset_grads() {
@@ -637,10 +657,11 @@ Tensor ReLU::forward(Tensor x) {
 
 	// Perform forward pass
 	if (in.get_location() == "cpu") {
-		_relu_host_fw(in.get_data(), out.get_data(), in_features, batch_size);
+		_relu_host_fw(in.get_data("cpu"), out.get_data("cpu"), in_features, batch_size);
 	}
+	
 	else if (in.get_location() == "gpu") {
-		_relu_device_fw<<<this->grid_size_fw, this->block_size_bw>>>(in.get_data(), out.get_data(), in_features, batch_size);
+		_relu_device_fw<<<this->grid_size_fw, this->block_size_fw>>>(in.get_data("cpu"), out.get_data("gpu"), in_features, batch_size);
 	};
 
 	return out;
@@ -649,42 +670,50 @@ Tensor ReLU::forward(Tensor x) {
 Tensor ReLU::backward(Tensor grad_out) {
 	/* Perform backward pass on batch */
 
-	if (grad_out.get_location() == "host") {
-		_relu_host_bw(in.get_data(), out.get_data(), grad_out.get_data(), grad_in.get_data(), in_features, batch_size);
+	if (grad_out.get_location() == "cpu") {
+		_relu_host_bw(in.get_data("cpu"), out.get_data("cpu"), grad_out.get_data("cpu"), grad_in.get_data("cpu"), in_features, batch_size);
 	}
-	else if (grad.get_location().get_name() == "device") {
-		_relu_device_bw<<<this->grid_size_bw, this->block_size_bw>>>(in.get_data(), out.get_data(), grad_out.get_data(), grad_in.get_data(), in_features, batch_size);
+	else if (grad.get_location() == "gpu") {
+		_relu_device_bw<<<1, 1>>>(in.get_data("gpu"), out.get_data("gpu"), grad_out.get_data("gpu"), grad_in.get_data("gpu"), in_features, batch_size);
 	};
 
 	return grad_in;
 };
 
+
 __host__ void _relu_host_fw(float* t_in, float* t_out, size_t in_features, size_t batch_size) {
-	/* Perform forward pass on batch (ReLU) */
+    /* Forward pass of ReLU activation function
+    */
+    
+    for (int i = 0; i < batch_size; i++) {
+        for (int j = 0; j < in_features; j++) {
+            t_out[i * in_features + j] = fmax(0.0, t_in[i * in_features + j]);
+        };
+    };
+};
 
-	for (int i = 0; i < in_features; i++) {
-		for (int j = 0; j < batch_size; j++) {
-			t_out[i * batch_size + j] = (t_in[i * batch_size + j] > 0) ? t_in[i * batch_size + j] : 0;
-		};
+__host__ void _relu_host_bw(float* t_in, float* t_out, float* t_grad_in, float* t_grad_out, size_t in_features, size_t batch_size) {
+    /* Backward pass of ReLU activation function
+    */
+
+};
+
+
+__global__ void _relu_device_fw(float* t_in, float* t_out, size_t in_features, size_t batch_size) {
+    /* Forward pass of ReLU activation function (on batched data) where the input block size is (32,32)
+	*/
+
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (x < batch_size && y < in_features) {
+		t_out[x * in_features + y] = fmax(0.0, t_in[x * in_features + y]);
 	};
 };
 
-__global__ void _relu_host_bw(float* t_in, float* t_out, float* t_grad_in, float* t_grad_out, size_t in_features, size_t batch_size) {
-	/* Perform backward pass on batch (ReLU) */
-
-	for (int i = 0; i < in_features; i++) {
-		for (int j = 0; j < batch_size; j++) {
-			t_grad_in[i * batch_size + j] = (t_out[i * batch_size + j] > 0) ? t_grad_out[i * batch_size + j] : 0;
-		};
-	};
-};
-
-__host__ void _relu_device_fw(float* t_in, float* t_out, size_t in_features, size_t batch_size) {
-	
-
-};
-
-__global__ void _relu_device_bw(float* t_in, float* t_out, float* t_grad_in, float* t_grad_out, size_t in_features, size_t batch_size) {
+__global__ void _relu_device_bwd(float* t_in, float* t_out, float* t_grad_in, float* t_grad_out, size_t in_features, size_t batch_size) {
+    /* Backward pass of ReLU activation function (on batched data)
+    */
 
 };
 
@@ -721,12 +750,6 @@ private:
 
 	dim3 grid_size_fw2;
 	dim3 block_size_fw2;
-
-	dim3 grid_size_bw1;
-	dim3 block_size_bw1;
-
-	dim3 grid_size_bw2;
-	dim3 block_size_bw2;
 
 	// Tensor storages
 	Tensor weights;   // W.T
@@ -771,7 +794,7 @@ Linear_layer::Linear_layer(size_t in_features, size_t out_features, std::string 
 
 	// Allocate gradient of loss w.r.t. input tensor (step 1 and 2)
 	this->grad_in = Tensor(in_features, batch_size, loc);
-	this->grad_out1 = Tensor(out_features, batch_size, loc);  // TODO: Is this correct size?
+	this->grad_out1 = Tensor(out_features, batch_size, loc);
 
 	// Initialize weights, bias and gradients to zeros (important)
 	this->weights.set_data(1);
@@ -789,19 +812,13 @@ Linear_layer::Linear_layer(size_t in_features, size_t out_features, std::string 
 	this->out1.set_data(0);
 	this->out2.set_data(0);
 
-	// Compute optimal kernel configuration for forward pass (step 1)
+	// Compute optimal kernel configuration for forward pass mm (thread grid equal to output matrix)
+	this->block_size_fw1 = dim3(32, 32);
+	this->grid_size_fw1 = dim3((out_features + block_size_fw1.x - 1) / block_size_fw1.x, (batch_size + block_size_fw1.y - 1) / block_size_fw1.y);
 
-
-
-	// Compute optimal kernel configuration for forward pass (step 2)
-
-
-	// Compute optimal kernel configuration for backward pass (step 1)
-
-
-	// Compute optimal kernel configuration for backward pass (step 2)
-
-
+	// Compute optimal kernel configuration for forward pass bias addition (thread grid equal to input/output matrix)
+	this->block_size_fw2 = dim3(32, 32);
+	this->grid_size_fw2 = dim3((out_features + block_size_fw2.x - 1) / block_size_fw2.x, (batch_size + block_size_fw2.y - 1) / block_size_fw2.y);
 };
 
 void Linear_layer::reset_grads() {
@@ -821,13 +838,13 @@ Tensor Linear_layer::forward(Tensor x) {
 
 	// Perform forward pass 
 	if (in.get_location() == "cpu") {
-		_ll_host_fwd_1(in.get_data(), weights.get_data(), out1.get_data(), in_features, out_features, batch_size);
-		_ll_host_fwd_2(out1.get_data(), bias.get_data(), out2.get_data(), in_features, out_features, batch_size);
+		_mm_host_fw(in.get_data("cpu"), weights.get_data("cpu"), out1.get_data("cpu"), in_features, out_features, batch_size);
+		_ba_host_fw(out1.get_data("gpu"), bias.get_data("cpu"), out2.get_data("cpu"), in_features, out_features, batch_size);
 	}
 
 	else if (in.get_location() == "gpu") {
-		_ll_device_fwd_1<<<this->grid_size_fw1, this->block_size_fw1>>>(in.get_data(), weights.get_data(), out1.get_data(), in_features, out_features, batch_size);
-		_ll_device_fwd_2<<<this->grid_size_fw2, this->block_size_fw2>>>(out1.get_data(), bias.get_data(), out2.get_data(), in_features, out_features, batch_size);
+		_mm_device_fw<<<this->grid_size_fw1, this->block_size_fw1>>>(in.get_data("gpu"), weights.get_data("gpu"), out1.get_data("gpu"), in_features, out_features, batch_size);
+		_ba_device_fw<<<this->grid_size_fw2, this->block_size_fw2>>>(out1.get_data("gpu"), bias.get_data("gpu"), out2.get_data("gpu"), in_features, out_features, batch_size);
 	};
 
 	return out2;
@@ -837,91 +854,102 @@ Tensor Linear_layer::backward(Tensor grad_out) {
 	/* Perform backward pass */
 
 	if (grad.get_location()== "cpu") {
-		_ll_host_bwd_2(out1.get_data(), bias.get_data(), out2.get_data(), grad_bias.get_data(), grad_out2.get_data(), grad_out1.get_data(), in_features, out_features, batch_size);
-		_ll_host_bwd_1(in.get_data(), weights.get_data(), out1.get_data(), grad_weights.get_data(), grad_out1.get_data(), grad_in.get_data(), in_features, out_features, batch_size);
+		_ba_host_bw(out1.get_data("cpu"), bias.get_data("cpu"), out2.get_data("cpu"), grad_bias.get_data("cpu"), grad_out2.get_data("cpu"), grad_out1.get_data("cpu"), in_features, out_features, batch_size);
+		_mm_host_bw(in.get_data("cpu"), weights.get_data("cpu"), out1.get_data("cpu"), grad_weights.get_data("cpu"), grad_out1.get_data("cpu"), grad_in.get_data("cpu"), in_features, out_features, batch_size);
 	}
 
 	else if (grad.get_location() == "gpu") {
-		_ll_device_bwd_2<<<this->grid_size_bw2, this->block_size_bw2>>>(out1.get_data(), bias.get_data(), out2.get_data(), grad_bias.get_data(), grad_out2.get_data(), grad_out1.get_data(), in_features, out_features, batch_size);
-		_ll_device_bwd_1<<<this->grid_size_bw1, this->block_size_bw1>>>(in.get_data(), weights.get_data(), out1.get_data(), grad_weights.get_data(), grad_out1.get_data(), grad_in.get_data(), in_features, out_features, batch_size);
+		_ba_device_bw<<<1,1>>>(out1.get_data("gpu"), bias.get_data("gpu"), out2.get_data("gpu"), grad_bias.get_data("gpu"), grad_out2.get_data("gpu"), grad_out1.get_data("gpu"), in_features, out_features, batch_size);
+		_mm_device_bw<<<1,1>>>(in.get_data("gpu"), weights.get_data("gpu"), out1.get_data("gpu"), grad_weights.get_data("gpu"), grad_in.get_data("gpu"), in_features, out_features, batch_size);
 	};
 
 	return grad_in;
 };
 
-__host__ void _ll_host_fwd(float* t_in, float* t_weights, float* t_out1, size_t in_features, size_t out_features, size_t batch_size) {
-	/* Perform forward pass on batch (all steps of linear layer) */
 
-	// W.T * x
-	for (int i = 0; i < out_features; i++) {
-		for (int j = 0; j < batch_size; j++) {
-			t_out1[i * batch_size + j] = 0.0f;
+__host__ void _mm_host_fw(float* t_in, float* t_weights, float* t_out, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Forward pass of matrix multiplication t_in * t_weights = t_out.
+        :param t_in: Input tensor of shape (in_features, batch_size)
+        :param t_weights: Weight tensor of shape (out_features, in_features)
+    */
 
-			for (int k = 0; k < in_features; k++) {
-				t_out1[i * batch_size + j] += t_weights[i * in_features + k] * t_in[k * batch_size + j];
-			};
-		};
-	};
-
-	// (W.T * x) + b 
-	for (int i = 0; i < out_features; i++) {
-		for (int j = 0; j < batch_size; j++) {
-			t_out1[i * batch_size + j] += t_bias[i];
-		};
-	};
+   for (int i = 0; i < batch_size; i++) {
+       for (int j = 0; j < out_features; j++) {
+           for (int k = 0; k < in_features; k++) {
+               t_out[i * out_features + j] += t_in[i * in_features + k] * t_weights[j * in_features + k];
+           };
+       };
+   }; 
 };
 
-__host__ void _ll_host_bwd(float* t_out1, float* t_bias, float* t_out2, float* t_grad_bias, float* t_grad_out1, size_t in_features, size_t out_features, size_t batch_size) {
-	/* Perform backward pass on batch (all steps of linear layer) */
+__host__ void _ba_host_fw(float* t_out1, float* t_bias, float* t_out2, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Forward pass of bias addition t_out1 + t_bias = t_out2.
+        :param t_out1: Input tensor of shape (in_features, batch_size)
+        :param t_bias: Bias tensor of shape (out_features, 1)
 
-	// Compute gradient of loss w.r.t. bias
-	for (int i = 0; i < out_features; i++) {
-		t_grad_bias[i] = 0.0f;
+        To obtain the correct dimensions, we need to broadcast the bias tensor (aka. expand dims)
+    */
 
-		for (int j = 0; j < batch_size; j++) {
-			t_grad_bias[i] += t_grad_out1[i * batch_size + j];
-		};
-	};
+    for (int i = 0; i < batch_size; i++) {
+        for (int j = 0; j < out_features; j++) {
+            t_out2[i * out_features + j] = t_out1[i * in_features + j] + t_bias[j];
+        };
+    };
+};
 
-	// Compute gradient of loss w.r.t. weights
-	for (int i = 0; i < out_features; i++) {
-		for (int j = 0; j < in_features; j++) {
-			t_grad_weights[i * in_features + j] = 0.0f;
-
-			for (int k = 0; k < batch_size; k++) {
-				t_grad_weights[i * in_features + j] += t_grad_out1[i * batch_size + k] * t_in[j * batch_size + k];
-			};
-		};
-	};
-
-	// Compute gradient of loss w.r.t. input
-	for (int i = 0; i < in_features; i++) {
-		for (int j = 0; j < batch_size; j++) {
-			t_grad_in[i * batch_size + j] = 0.0f;
-
-			for (int k = 0; k < out_features; k++) {
-				t_grad_in[i * batch_size + j] += t_weights[k * in_features + i] * t_grad_out1[k * batch_size + j];
-			};
-		};
-	};
-
+__host__ void _ba_host_bw(float* t_out1, float* t_bias, float* t_out2, float* t_grad_bias, float* t_grad_out1, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Backward pass of bias addition t_out1 + t_bias = t_out2 */
 
 };
 
-__global__ void _ll_device_fwd_1(float* t_in, float* t_weights, float* t_out1, size_t in_features, size_t out_features, size_t batch_size) {
-	
+__host__ void _mm_host_bw(float* t_in, float* t_weights, float* t_out, float* t_grad_weights, float* t_grad_in, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Backward pass of matrix multiplication t_in * t_weights = t_out. */
+
 };
 
-__global__ void _ll_device_fwd_2(float* t_out1, float* t_bias, float* t_out2, size_t in_features, size_t out_features, size_t batch_size) {
-	
+
+__global__ void _mm_device_fw(float* t_in, float* t_weights, float* t_out, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Matrix multiplication forward pass with a (32,32) block size and grid_size that
+	   matches the output matrix */
+
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (x < batch_size && y < out_features) {
+		float sum = 0.0f;
+
+		for (int i = 0; i < in_features; i++) {
+			sum += t_in[x * in_features + i] * t_weights[y * in_features + i];
+		};
+
+		t_out[x * out_features + y] = sum;
+	};
 };
 
-__global__ void _ll_device_bwd_1(float* t_in, float* t_weights, float* t_out1, float* t_grad_weights, float* t_grad_out1, size_t in_features, size_t out_features, size_t batch_size) {
-	
+__global__ void _ba_device_fw(float* t_out1, float* t_bias, float* t_out2, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Forward pass of bias addition t_out1 + t_bias = t_out2 with a (32,32) block size and 
+	   grid_size that matches the input/output matrix.
+
+        :param t_out1: Input tensor of shape (in_features, batch_size)
+        :param t_bias: Bias tensor of shape (out_features, 1)
+    */
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (x < batch_size && y < out_features) {
+		t_out2[x * out_features + y] = t_out1[x * in_features + y] + t_bias[y];
+	};
 };
 
-__global__ void _ll_device_bwd_2(float* t_out1, float* t_bias, float* t_out2, float* t_grad_bias, float* t_grad_out1, size_t in_features, size_t out_features, size_t batch_size) {
-	
+__global__ void _mm_device_bw(float* t_in, float* t_weights, float* t_out, float* t_grad_weights, float* t_grad_in, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Backward pass of matrix multiplication */
+
+};
+
+__global__ void _ba_device_bw(float* t_out1, float* t_bias, float* t_out2, float* t_grad_bias, float* t_grad_out1, size_t in_features, size_t out_features, size_t batch_size) {
+    /* Backward pass of bias addition t_out1 + t_bias = t_out2 */
+
 };
 
 /****************************************************************************/
@@ -1067,17 +1095,20 @@ private:
 	dim3 grid_size_fw1;
 	dim3 block_size_fw1;
 
-	dim3 grid_size_fw2;
-	dim3 block_size_fw2;
+	int block_size_fw2;
+	int grid_size_fw2;
 
-	dim3 grid_size_fw3;
-	dim3 block_size_fw3;
+	int block_size_fw3;
+	int grid_size_fw3;
 
 	dim3 grid_size_fw4;
 	dim3 block_size_fw4;
 
-	dim3 grid_size_fw5;
-	dim3 block_size_fw5;
+	int block_size_fw5;
+	int grid_size_fw5;
+
+	int block_size_fw6;
+	int grid_size_fw6;
 
 	// Tensor storages
 	Tensor pred_logits;     // Logits from model
@@ -1087,13 +1118,15 @@ private:
 	Tensor out2;
 	Tensor out3;
 	Tensor out4;
-	Tensor out5;            // Final output (loss)
+	Tensor out5;            
+	Tensor out6;			// Final output (loss)
 
 	Tensor grad_out1;
 	Tensor grad_out2;
 	Tensor grad_out3;
 	Tensor grad_out4;
-	Tensor grad_out5;       // Gradient of loss w.r.t. logits (input)
+	Tensor grad_out5;       
+	Tensor grad_out6;		// Gradient of loss w.r.t. logits (input)
 };
 
 Cross_entropy::Cross_entropy(size_t num_classes, std::string loc, size_t batch_size) : loc { loc }, num_classes{ num_classes }, batch_size{ batch_size } {
@@ -1101,9 +1134,11 @@ Cross_entropy::Cross_entropy(size_t num_classes, std::string loc, size_t batch_s
 
 	// Allocate intermediate output tensors (not pinned - only used for computation)
 	this->out1 = Tensor(num_classes, batch_size, loc);
-	this->out2 = Tensor(num_classes, batch_size, loc);
-	this->out3 = Tensor(num_classes, batch_size, loc);
+	this->out2 = Tensor(1, batch_size, loc);
+	this->out3 = Tensor(1, batch_size, loc);
 	this->out4 = Tensor(num_classes, batch_size, loc);
+	this->out5 = Tensor(num_classes, batch_size, loc);
+	this->out6 = Tensor(1, batch_size, loc);
 
 	// Allocate final output (loss) tensor (pinned if device is main location)
 	if (loc == "cpu") {
@@ -1115,10 +1150,12 @@ Cross_entropy::Cross_entropy(size_t num_classes, std::string loc, size_t batch_s
 
 	// Allocate gradient tensors (not pinned - only used for computation)
 	this->grad_out1 = Tensor(num_classes, batch_size, loc);
-	this->grad_out2 = Tensor(num_classes, batch_size, loc);
-	this->grad_out3 = Tensor(num_classes, batch_size, loc);
+	this->grad_out2 = Tensor(1, batch_size, loc);
+	this->grad_out3 = Tensor(1, batch_size, loc);
+
 	this->grad_out4 = Tensor(num_classes, batch_size, loc);
 	this->grad_out5 = Tensor(num_classes, batch_size, loc);
+	this->grad_out6 = Tensor(1, batch_size, loc);
 
 	// Initialize grad to zeros (important)
 	this->grad_out1.set_data(0);
@@ -1126,6 +1163,7 @@ Cross_entropy::Cross_entropy(size_t num_classes, std::string loc, size_t batch_s
 	this->grad_out3.set_data(0);
 	this->grad_out4.set_data(0);
 	this->grad_out5.set_data(0);
+	this->grad_out6.set_data(0);
 
 	// Initialize output to zeros (for debugging purposes)
 	this->out1.set_data(0);
@@ -1133,17 +1171,29 @@ Cross_entropy::Cross_entropy(size_t num_classes, std::string loc, size_t batch_s
 	this->out3.set_data(0);
 	this->out4.set_data(0);
 	this->out5.set_data(0);
+	this->out6.set_data(0);
 
-	// Compute optimal kernel configuration for forward pass (step 1)
+	// Kernel configuration for forward pass step 1 (grid size equal to output matrix)
+	this->block_size_fw1 = dim3(32, 32);
+	this->grid_size_fw1 = dim3((num_classes + block_size_fw1.x - 1) / block_size_fw1.x, (batch_size + block_size_fw1.y - 1) / block_size_fw1.y);
 
-	// Compute optimal kernel configuration for forward pass (step 2)
+	// Kernel configuration for forward pass step 2 (assume max labels is 32)
+	block_size_fw2 = 32;
+	grid_size_fw2 = (num_classes + block_size_fw2 - 1) / block_size_fw2;
 
-	// Compute optimal kernel configuration for forward pass (step 3)
+	// Kernel configuration for forward pass step 3 (grid size equal to output vector
+	// of size batch_size - a 1D block_size is sufficient)
+	block_size_fw3 = 32;
+	grid_size_fw3 = (batch_size + block_size_fw3 - 1) / block_size_fw3;
 
-	// Compute optimal kernel configuration for forward pass (step 4)
+	// Kernel configuration for forward pass step 4 (grid size equal to output matrix)
+	block_size_fw4 = dim3(32, 32);
+	grid_size_fw4 = dim3((num_classes + block_size_fw4.x - 1) / block_size_fw4.x, (batch_size + block_size_fw4.y - 1) / block_size_fw4.y);
 
-	// Compute optimal kernel configuration for forward pass (step 5)
-
+	// Kernel configuration for forward pass step 5 (grid size equal to output vector
+	// of size batch_size - a 1D block_size is sufficient)
+	block_size_fw5 = 32;
+	grid_size_fw5 = (batch_size + block_size_fw5 - 1) / block_size_fw5;
 };
 
 void Cross_entropy::reset_grads() {
@@ -1154,6 +1204,7 @@ void Cross_entropy::reset_grads() {
 	this->grad_out3.set_data(0);
 	this->grad_out4.set_data(0);
 	this->grad_out5.set_data(0);
+	this->grad_out6.set_data(0);
 };
 
 Tensor Cross_entropy::forward(Tensor x, Tensor y) {
@@ -1185,11 +1236,6 @@ Tensor Cross_entropy::forward(Tensor x, Tensor y) {
 	   Step 3: Compute the s_2 = log(s) scalar (apply log to scalar from step 2)
 	   Step 4: Compute y_j * (x_j - s_2) (using element-wise/dot kernel)
 	   Step 5: Compute the sum of the loss (using reduction kernel again)
-
-	   The forward kernel configuration can be chosen so that the number of threads
-	   is equal to the number of classes (num_classes) and the number of blocks is
-	   equal to the number of observations in the batch (batch_size). This way we
-	   can compute the loss for each observation in the batch in parallel.
 	*/
 
 	// Save logits and labels for backward pass
@@ -1198,24 +1244,22 @@ Tensor Cross_entropy::forward(Tensor x, Tensor y) {
 
 	// Forward pass
 	if (x.get_location() == "cpu") {
-		_ce_host_fwd_1(pred_logits.get_data(), out1.get_data(), num_classes, batch_size);
-		_ce_host_fwd_2(out1.get_data(), out2.get_data(), num_classes, batch_size);
-		_ce_host_fwd_3(out2.get_data(), out3.get_data(), num_classes, batch_size);
-		_ce_host_fwd_4(out3.get_data(), out4.get_data(), true_probs.get_data(), num_classes, batch_size);
-		_ce_host_fwd_2(out4.get_data(), out5.get_data(), num_classes, batch_size);
+		_ce_host_fw(x.get_data("cpu"), y.get_data("cpu"), out6.get_data("cpu"), num_classes, batch_size);
+
 	}
 	else if (x.get_location() == "gpu") {
-		_ce_device_fwd_1<<<grid_size_fwd_1, block_size_fwd_1>>>(pred_logits.get_data(), out1.get_data(), num_classes, batch_size);
-		_ce_device_fwd_2<<<grid_size_fwd_2, block_size_fwd_2>>>(out1.get_data(), out2.get_data(), num_classes, batch_size);
-		_ce_device_fwd_3<<<grid_size_fwd_3, block_size_fwd_3>>>(out2.get_data(), out3.get_data(), num_classes, batch_size);
-		_ce_device_fwd_4<<<grid_size_fwd_4, block_size_fwd_4>>>(out3.get_data(), out4.get_data(), true_probs.get_data(), num_classes, batch_size);
-		_ce_device_fwd_2<<<grid_size_fwd_5, block_size_fwd_5>>>(out4.get_data(), out5.get_data(), num_classes, batch_size);
+		_ce_device_fw_1<<<grid_size_fw1, block_size_fw1>>>(x.get_data("gpu"), out1.get_data("gpu"), num_classes, batch_size);
+		_ce_device_fw_2<<<grid_size_fw2, block_size_fw2>>>(out1.get_data("gpu"), out2.get_data("gpu"), num_classes, batch_size);
+		_ce_device_fw_3<<<grid_size_fw3, block_size_fw3>>>(out2.get_data("gpu"), out3.get_data("gpu"), num_classes, batch_size);
+		_ce_device_fw_4<<<grid_size_fw4, block_size_fw4>>>(out3.get_data("gpu"), out4.get_data("gpu"), true_probs.get_data("gpu"), num_classes, batch_size);
+		_ce_device_fw_5<<<grid_size_fw5, block_size_fw5>>>(out4.get_data("gpu"), out5.get_data("gpu"), num_classes, batch_size);
+		_ce_device_fw_2<<<grid_size_fw2, block_size_fw2>>>(out5.get_data("gpu"), out6.get_data("gpu"), num_classes, batch_size);
 	};
 
-	return out5;
+	return out6;
 };
 
-Tensor Cross_entropy::backward(Tensor grad_out5) {
+Tensor Cross_entropy::backward() {
 	/* Perform backward pass through computationally stable cross entropy loss. 
 	   To match the forward pass, the backward pass is split into 5 steps:
 
@@ -1225,101 +1269,152 @@ Tensor Cross_entropy::backward(Tensor grad_out5) {
 	   Step 2: Compute the gradient of the loss w.r.t. the exp(x_k) vector
 	   Step 1: Compute the gradient of the loss w.r.t. the logits (x_j)
 	*/
-	if (grad.get_location().get_name() == "cpu") {
-		_ce_host_bwd_5(out4.get_data(), grad_out5.get_data(), num_classes, batch_size);
-		_ce_host_bwd_4(out3.get_data(), out4.get_data(), grad_out4.get_data(), num_classes, batch_size);
-		_ce_host_bwd_3(out2.get_data(), out3.get_data(), grad_out3.get_data(), num_classes, batch_size);
-		_ce_host_bwd_2(out1.get_data(), out2.get_data(), grad_out2.get_data(), num_classes, batch_size);
-		_ce_host_bwd_1(pred_logits.get_data(), out1.get_data(), grad_out1.get_data(), num_classes, batch_size);	
+	if (grad.get_location() == "cpu") {
+		_ce_host_bw(pred_logits.get_data("cpu"), true_probs.get_data("cpu"), grad_out6.get_data("cpu"), num_classes, batch_size);
 	}
-	else if (grad.get_location().get_name() == "gpu") {
-		_ce_device_bwd_5<<<grid_size_bwd_5, block_size_bwd_5>>>(out4.get_data(), grad_out5.get_data(), num_classes, batch_size);
-		_ce_device_bwd_4<<<grid_size_bwd_4, block_size_bwd_4>>>(out3.get_data(), out4.get_data(), grad_out4.get_data(), num_classes, batch_size);
-		_ce_device_bwd_3<<<grid_size_bwd_3, block_size_bwd_3>>>(out2.get_data(), out3.get_data(), grad_out3.get_data(), num_classes, batch_size);
-		_ce_device_bwd_2<<<grid_size_bwd_2, block_size_bwd_2>>>(out1.get_data(), out2.get_data(), grad_out2.get_data(), num_classes, batch_size);
-		_ce_device_bwd_1<<<grid_size_bwd_1, block_size_bwd_1>>>(pred_logits.get_data(), out1.get_data(), grad_out1.get_data(), num_classes, batch_size);
+	else if (grad.get_location() == "gpu") {
+		// TODO: NOT IMPLEMENTED YET
+		std::cout << "Not implemented yet" << std::endl;
 	};
 
 	return grad_out1;
 };
 
-__host__ float* _ce_host_fwd(float* t_out4, float* t_out5, size_t num_classes, size_t batch_size) {
-	/* Compute all steps of the forward pass of the stable cross entropy loss: L = -sum_j(y_j * (x_j - log(sum_k(exp(x_k))))*/
+__host__ void _ce_host_fw(float* t_in, float* t_y, float* t_out, size_t num_classes, size_t batch_size) {
+    /* Compute stable softmax and cross-entropy loss. Formula: L = -sum_j(y_j * (x_j - log(sum_k(exp(x_k)))). 
+       Here j is the class index and so is k. 
+    
+    :param t_in: Matrix of shape (num_classes, batch_size) with predicted logits 
+    :param t_y: Matrix of shape (num_classes, batch_size) with one-hot encoded labels
+    :param t_out: Vector of shape (batch_size) with cross-entropy loss
+    */
 
-	// Compute the sum of exp(x_k) for each observation in the batch
-	for (int i = 0; i < batch_size; i++) {
-		float sum_exp = 0.0f;
-		for (int j = 0; j < num_classes; j++) {
-			sum_exp += exp(t_out4[i * num_classes + j]);
-		}
-		t_out5[i] = sum_exp;
-	}
+    // Compute stable softmax cross-entropy loss for each batch one-by-one (loop)
+    for (int i = 0; i < batch_size; i++) {
+        // Compute the sum of exponentials of the logits
+        float sum_exp = 0.0;
+        for (int j = 0; j < num_classes; j++) {
+            sum_exp += exp(t_in[j * batch_size + i]);
+        };
 
-	// Compute the loss for each observation in the batch
-	for (int i = 0; i < batch_size; i++) {
-		float loss = 0.0f;
-		for (int j = 0; j < num_classes; j++) {
-			float y_j = t_out1[i * num_classes + j];
-			float x_j = t_pred_logits[i * num_classes + j];
-			float log_sum_exp = log(t_out5[i]);
-			loss -= y_j * (x_j - log_sum_exp);
-		}
-		t_out4[i] = loss;
-	}
+        // Compute the cross-entropy loss
+        for (int j = 0; j < num_classes; j++) {
+            t_out[i] -= t_y[j * batch_size + i] * (t_in[j * batch_size + i] - log(sum_exp));
+        };
+    };
+}
 
-	return t_out4;
+__host__ void _ce_host_bw(float* t_in, float* t_y, float* t_grad_in, size_t num_classes, size_t batch_size) {
+    /* Compute the gradient of the stable softmax cross-entropy loss w.r.t. the input logits (t_in) on host
 
+    :param t_in: Matrix of shape (num_classes, batch_size) with predicted logits
+    :param t_y: Matrix of shape (num_classes, batch_size) with one-hot encoded labels
+    :param t_grad_in: Matrix of shape (num_classes, batch_size) with gradients of loss w.r.t. input
+    :param t_grad_out: Vector of shape (batch_size) with gradients of loss w.r.t. output
+    */
 
+    // Compute the gradient of the stable softmax cross-entropy loss w.r.t. the input logits
+    for (int i = 0; i < batch_size; i++) {
+        // Compute the sum of exponentials of the logits
+        float sum_exp = 0.0;
+        for (int j = 0; j < num_classes; j++) {
+            sum_exp += exp(t_in[j * batch_size + i]);
+        };
 
+        // Compute the gradient of the loss w.r.t. the input logits
+        for (int j = 0; j < num_classes; j++) {
+            t_grad_in[j * batch_size + i] = (exp(t_in[j * batch_size + i]) / sum_exp) - t_y[j * batch_size + i];
+        };
+    };
+};
 
+__global__ void _ce_device_fw_1(float* t_pred_logits, float* t_out1, size_t num_classes, size_t batch_size) {
+	/* Step 1: Compute exp(x) element-wise of entire matrix. The kernel configuration is set so that the 
+	           grid size is equal to the output matrix (num_classes, batch_size) and the block size is 
+			   (32,32) for each step. 
+	*/
 
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
+	if (x < batch_size && y < num_classes) {
+		t_out1[y * batch_size + x] = exp(t_pred_logits[y * batch_size + x]); //TODO: Use non-precise exp
+	};
+};
 
+__global__ void _ce_device_fw_2(float* t_out1, float* t_out2, size_t num_classes, size_t batch_size) {
+	/* Step 2: Compute the s_1 = sum_k(exp(x_k)) scalar (using reduction)
+    */
+
+   // TODO: Insert exercise code here
 
 };
 
-__host__ float* _ce_host_bwd(float* t_pred_logits, float* t_out1, float* t_grad_out1, size_t num_classes, size_t batch_size) {
-	
+__global__ void _ce_device_fw_3(float* t_out2, float* t_out3, size_t num_classes, size_t batch_size) {
+	/* Step 3: Compute the s_2 = log(s) scalar on device (using element-wise kernel).
+    
+    :param t_out2: Vector of shape (batch_size) with sum(exp(x_k)) elements
+    :param t_out3: Vector of shape (batch_size) with log(sum(exp(x_k))) elements
+
+    */
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x < batch_size) {
+        t_out3[x] = log(t_out2[x]);
+    };
+};
+
+__global__ void _ce_device_fw_4(float* t_out3, float* t_pred_logits, float* t_out4, size_t num_classes, size_t batch_size) {
+	/* Step 4: Compute (x_j - s_j) (simple element-wise subtraction) where s_j is the log(sum_k(exp(x_k)))
+       scalar which should be broadcasted across the entire row of the matrix t_pred_logits. The grid size
+       is batch_size and block size is num_classes.
+    
+    :param t_out3: Vector of shape (batch_size) with log(sum_k(exp(x_k))) elements (one for each class)
+    :param t_pred_logits: Matrix of shape (num_classes, batch_size) with predicted logits
+    :param t_out4: Matrix of shape (num_classes, batch_size) with (x_j - s_j) elements    
+
+    */
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (x < batch_size && y < num_classes) {
+		t_out4[y * batch_size + x] = t_pred_logits[y * batch_size + x] - t_out3[x];
+	};
+};
+
+__global__ void _ce_device_fw_5(float* t_out4, float* t_true_probs, float* t_out5, size_t num_classes, size_t batch_size) {
+    /* Step 5 Compute the elementwise product along the row of the matrix t_out4 and t_true_probs. The grid size
+	   is batch_size and block size is num_classes.
+	*/
+
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (x < batch_size && y < num_classes) {
+		t_out5[y * batch_size + x] = t_out4[y * batch_size + x] * t_true_probs[y * batch_size + x];
+	};
+}
+
+
+__global__ void _ce_device_bw_1(float* t_pred_logits, float* t_out1, size_t num_classes, size_t batch_size) {
 
 };
 
-__global__ float* _ce_device_fwd_1(float* t_pred_logits, float* t_out1, size_t num_classes, size_t batch_size) {
-	/* Step 1: Compute the exp(x) vector (using element-wise kernel) */
+__global__ void _ce_device_bw_2(float* t_out1, float* t_out2, size_t num_classes, size_t batch_size) {
 
 };
 
-__global__ float* _ce_device_fwd_2(float* t_out1, float* t_out2, size_t num_classes, size_t batch_size) {
-	/* Step 2: Compute the s_1 = sum(exp(x_k)) scalar (using reduction kernel) */
+__global__ void _ce_device_bw_3(float* t_out2, float* t_out3, size_t num_classes, size_t batch_size) {
 
 };
 
-__global__ float* _ce_device_fwd_3(float* t_out2, float* t_out3, size_t num_classes, size_t batch_size) {
-	/* Step 3: Compute the s_2 = log(s) scalar (apply log to scalar from step 2) */
+__global__ void _ce_device_bw_4(float* t_out3, float* t_pred_logits, float* t_out4, size_t num_classes, size_t batch_size) {
 
 };
 
-__global__ float* _ce_device_fwd_4(float* t_out3, float* t_out4, float* t_true_probs, size_t num_classes, size_t batch_size) {
-	/* Step 4: Compute y_j * (x_j - s_2) (using element-wise/dot kernel) */
-
-};
-
-__global__ float* _ce_device_bwd_1(float* t_pred_logits, float* t_out1, float* t_grad_out1, size_t num_classes, size_t batch_size) {
-	/* Step 1: Compute the gradient of the loss w.r.t. the logits (x_j) */
-
-};
-
-__global__ float* _ce_device_bwd_2(float* t_out1, float* t_out2, float* t_grad_out2, size_t num_classes, size_t batch_size) {
-	/* Step 2: Compute the gradient of the loss w.r.t. the exp(x_k) vector */
-
-};
-
-__global__ float* _ce_device_bwd_3(float* t_out2, float* t_out3, float* t_grad_out3, size_t num_classes, size_t batch_size) {
-	/* Step 3: Compute the gradient of the loss w.r.t. the sum of exp(x_k) */
-
-};
-
-__global__ float* _ce_device_bwd_4(float* t_out3, float* t_out4, float* t_grad_out4, size_t num_classes, size_t batch_size) {
-	/* Step 4: Compute the gradient of the loss w.r.t. the scalar s_2 */
+__global__ void _ce_device_bw_5(float* t_out4, float* t_true_probs, float* t_out5, size_t num_classes, size_t batch_size) {
 
 };
 
@@ -1366,6 +1461,14 @@ SGD::SGD(float lr, MLP* model, Cross_entropy* loss_fn, std::string loc) : lr{ lr
 	// Get gradients of weights and biases from model
 	grad_weights = model->get_grad_weights();
 	grad_bias = model->get_grad_biases();
+
+	// Kernel configuration for weight update can be 2D
+	block_size_weights = dim3(32, 32);
+	grid_size = dim3((weights[0].get_shape()[0] + block_size_weights.x - 1) / block_size_weights.x, (weights[0].get_shape()[1] + block_size_weights.y - 1) / block_size_weights.y);
+
+	// Kernel configuration for bias update can be 1D
+	block_size_bias = 32;
+	grid_size = (bias[0].get_shape()[0] + block_size_bias - 1) / block_size_bias;
 };
 
 void SGD::reset_grads() {
@@ -1378,12 +1481,12 @@ void SGD::reset_grads() {
 void SGD::step() {
 	/* Perform optimization step (after backward has been called) */
 
-	if (loc.get_name() == "cpu") {
+	if (loc == "cpu") {
 		for (int i = 0; i < weights.size(); i++) {
 			_update_host(weights[i], grad_weights[i], bias[i], grad_bias[i], lr);
 		};
 	}
-	else if (loc.get_name() == "gpu") {
+	else if (loc == "gpu") {
 		for (int i = 0; i < weights.size(); i++) {
 			_weight_update_device<<<grid_size, block_size_weights>>>(weights[i], grad_weights[i], lr);
 			_bias_update_device<<<grid_size, block_size_bias>>>(bias[i], grad_bias[i], lr);
@@ -1391,16 +1494,44 @@ void SGD::step() {
 	};
 };
 
-__host__ void _update_host(float* t_weights, float* t_grad_weights, float* t_bias, float* t_grad_bias, float lr) {
-	/* Update weights and biases on host */
+__host__ void _update_weights(float* t_weights, float* t_grad_weights, float* t_bias, float* t_grad_bias, float lr) {
+	/* Update weights on host (where the weights are stored as 1D array even though it is a 2D matrix) */
 
+	for (int i = 0; i < t_weights.get_shape()[0]; i++) {
+		for (int j = 0; j < t_weights.get_shape()[1]; j++) {
+			t_weights[i * t_weights.get_shape()[1] + j] -= lr * t_grad_weights[i * t_weights.get_shape()[1] + j];
+		};
+	};
 };
 
-__global__ void update_device(float* t_weights, float* t_grad_weights, float lr) {
+__host__ void _update_bias(float* t_bias, float* t_grad_bias, float lr) {
+	/* Update bias on host */
+
+	for (int i = 0; i < t_bias.get_shape()[0]; i++) {
+		t_bias[i] -= lr * t_grad_bias[i];
+	};
+};
+
+__global__ void update_weights(float* t_weights, float* t_grad_weights, float lr) {
 	/* Update weights on device */
 
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (x < t_weights.get_shape()[0] && y < t_weights.get_shape()[1]) {
+		t_weights[x * t_weights.get_shape()[1] + y] -= lr * t_grad_weights[x * t_weights.get_shape()[1] + y];
+	};
 };
 
+__global__ void update_bias(float* t_bias, float* t_grad_bias, float lr) {
+	/* Update bias on device */
+
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (x < t_bias.get_shape()[0]) {
+		t_bias[x] -= lr * t_grad_bias[x];
+	};
+};
 
 /****************************************************************************/
 /****************************************************************************/
@@ -1412,9 +1543,7 @@ void process(Config cfg, Data_loader data_loader, MLP model, Cross_entropy loss_
 
 	// Setup variables
 	int epoch_size = data_loader.get_num_batches();
-
-	// Storage 
-	float epoch_acc = 0;
+	float loss_acc = 0;
 
 	for (int batch_idx = 0; batch_idx < epoch_size; batch_idx++) {
 		// Get batch: Pointers to host memory locations (pinned)
@@ -1422,21 +1551,10 @@ void process(Config cfg, Data_loader data_loader, MLP model, Cross_entropy loss_
 		Tensor imgs = batch.first;
 		Tensor labels = batch.second;
 
-		// TODO: cudaMemcpyAsync (above) is non-blocking so we need to synchronize here
-		//       but to use it we need to make sure that the data is not being used in
-		//       the forward pass (which is the case here). Thus, we would need to have
-		// 	     a separate buffer for the data that we can copy to and from (so that we
-		//       can copy the data to the buffer and then copy from the buffer to the
-		//       pinned memory). This would require a separate buffer for each batch
-		//       which is not optimal. We could also use streams to overlap computation
-		//       and data transfer but this is more complex and requires more memory
-		//       as we need to have multiple streams for each batch.
-
-
 		// Move from pinned host to device memory
-		if (main_location.get_name() == "device") {
-			x.copy_to_device();
-			y.copy_to_device();
+		if (loc == "gpu") {
+			imgs.to("gpu");
+			labels.to("gpu")
 		};
 
 		// Forward pass
@@ -1445,31 +1563,29 @@ void process(Config cfg, Data_loader data_loader, MLP model, Cross_entropy loss_
 
 		// Backward pass and optimization step 
 		if (mode == "train") {
-			model.backward(loss_fn.backward(1.0f));
+			auto grad = loss_fn.backward();
+			auto grad = model.backward(grad);
 			optimizer.step();
 			optimizer.reset_grads();
 		};
 
-		// Move from device to pinned host memory
-		if (main_location.get_name() == "device") {
-			logits.copy_to_host();
-			labels.copy_to_host();
-		};
-
-		// Batch accuracy and loss
-		float batch_acc = accuracy(logits, labels);
-		
+		// Synchronize to not overide the current batch before all threads are done
+		// and before that to make sure that the data is moved back to host memory
+		// before we access the host memory for logging purposes.
 		cudaDeviceSynchronize();
 
-		epoch_acc += batch_acc.to("cpu").get_data()[0] 
+		// Save loss (scalar) to device tensor at index batch_idx
+		if (loc == "gpu") {
+			loss.to("cpu");
+		};
+
+		loss_acc += loss.get_data("cpu")[0];
 	};
 
-	// Average epoch loss and accuracy
-	epoch_acc /= epoch_size;
-
-	// Log epoch loss and accuracy
+	// Compute epoch loss and log it
+	float epoch_loss = loss_acc / epoch_size;
 	int idx = (mode == "train") ? epoch_idx + 1 : -1;
-	logger.log(idx, epoch_acc);
+	logger.log(idx, epoch_loss);
 };
 
 /****************************************************************************/
@@ -1516,7 +1632,7 @@ int main() {
 
 	// Initialize optimizer. We initialize it with pointers to the model parameters 
 	// in the main location so that we can always access them when we do updates with .step()
-	SGD optimizer(cfg.lr, model.get_weights(), model.get_biases(), model.get_grad_weights(), model.get_grad_biases(), cfg.loc);
+	SGD optimizer(cfg.lr, &model, &loss_fn, cfg.loc);
 
 	// Print setup time
 	t_end = omp_get_wtime();
@@ -1546,12 +1662,3 @@ int main() {
 
 	return 0;
 };
-
-
-
-
-// https://luniak.io/cuda-neural-network-implementation-part-1/ (fwd/bwd parallel)
-// https://stackoverflow.com/questions/53498952/tensorflow-horovod-nccl-and-mpi (nccl and MPI data parallism)
-// https://github.com/olcf-tutorials/MPI_ping_pong (cuda-aware MPI)
-
-
